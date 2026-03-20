@@ -155,6 +155,10 @@ public:
     float globalMapVisualizationPoseDensity;
     float globalMapVisualizationLeafSize;
 
+    // localization parameters
+    float mappingCornerLeafSize;
+    std::string mapPath;
+
     ParamServer(std::string node_name, const rclcpp::NodeOptions & options) : Node(node_name, options)
     {   
         declare_parameter<string>("history_policy", "history_keep_last");
@@ -311,12 +315,18 @@ public:
         get_parameter("historyKeyframeFitnessScore", historyKeyframeFitnessScore);
 
 
-       declare_parameter<float>("globalMapVisualizationSearchRadius", 1e3f);
+        declare_parameter<float>("globalMapVisualizationSearchRadius", 1e3f);
         get_parameter("globalMapVisualizationSearchRadius", globalMapVisualizationSearchRadius);
         declare_parameter<float>("globalMapVisualizationPoseDensity", 10.0);
         get_parameter("globalMapVisualizationPoseDensity", globalMapVisualizationPoseDensity);
         declare_parameter<float>("globalMapVisualizationLeafSize", 1.0f);
         get_parameter("globalMapVisualizationLeafSize", globalMapVisualizationLeafSize);
+
+        declare_parameter<float>("mappingCornerLeafSize", 0.2f);
+        get_parameter("mappingCornerLeafSize", mappingCornerLeafSize);
+
+        declare_parameter<std::string>("mapPath", "/home");
+        get_parameter("mapPath", mapPath);
 
         usleep(100);
     }

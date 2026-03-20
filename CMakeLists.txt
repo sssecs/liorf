@@ -78,6 +78,12 @@ target_compile_options(${PROJECT_NAME}_mapOptmization PRIVATE ${OpenMP_CXX_FLAGS
 ament_target_dependencies(${PROJECT_NAME}_mapOptmization ${ros2_lib})
 target_link_libraries(${PROJECT_NAME}_mapOptmization Boost::timer "${cpp_typesupport_target}" ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${OpenMP_CXX_FLAGS} ${GeographicLib_LIBRARIES} gtsam)
 
+# # Mapping Optimization
+add_executable(${PROJECT_NAME}_mapOptmizationLocalization src/mapOptmizationLoca.cpp ${common_lib} include/Scancontext.cpp)
+target_compile_options(${PROJECT_NAME}_mapOptmizationLocalization PRIVATE ${OpenMP_CXX_FLAGS})
+ament_target_dependencies(${PROJECT_NAME}_mapOptmizationLocalization ${ros2_lib})
+target_link_libraries(${PROJECT_NAME}_mapOptmizationLocalization Boost::timer "${cpp_typesupport_target}" ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${OpenMP_CXX_FLAGS} ${GeographicLib_LIBRARIES} gtsam)
+
 # # IMU Preintegration
 add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp ${common_lib})
 ament_target_dependencies(${PROJECT_NAME}_imuPreintegration ${ros2_lib})
@@ -93,6 +99,7 @@ install(
 	${PROJECT_NAME}_imageProjection
 	${PROJECT_NAME}_imuPreintegration
 	${PROJECT_NAME}_mapOptmization
+  ${PROJECT_NAME}_mapOptmizationLocalization
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -59,6 +59,26 @@ enum class SCInputType
     MULTI_SCAN_FEAT 
 }; 
 
+struct KnownMap
+{
+    pcl::PointCloud<PointType>::Ptr global_map_raw;
+    pcl::PointCloud<PointType>::Ptr surface_map_raw;
+    pcl::PointCloud<PointType>::Ptr trajectory_raw;
+    pcl::PointCloud<PointTypePose>::Ptr transformations_raw;
+
+    std::vector<pcl::PointCloud<PointType>::Ptr> surface_points_in_keyframes;
+
+    KnownMap()
+    {
+        global_map_raw.reset(new pcl::PointCloud<PointType>);
+        surface_map_raw.reset(new pcl::PointCloud<PointType>);
+        trajectory_raw.reset(new pcl::PointCloud<PointType>);
+        transformations_raw.reset(new pcl::PointCloud<PointTypePose>);
+    }
+
+
+};
+
 class mapOptimization : public ParamServer
 {
 
@@ -160,6 +180,13 @@ public:
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> br;
 
+    KnownMap known_map_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubKnownMap_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr sub_initial_pose_;
+    PointTypePose initpose_;
+    pcl::KdTreeFLANN<PointType>::Ptr kdtree_keyposes_3d_;
+    pcl::PointCloud<PointType>::Ptr surface_points_near_init_;
+
     mapOptimization(const rclcpp::NodeOptions & options) : ParamServer("liorf_mapOptimization", options)
     {
         ISAM2Params parameters;
@@ -173,6 +200,10 @@ public:
                     std::bind(&mapOptimization::gpsHandler, this, std::placeholders::_1));
         subLoop = create_subscription<std_msgs::msg::Float64MultiArray>("lio_loop/loop_closure_detection", QosPolicy(history_policy, reliability_policy),
                     std::bind(&mapOptimization::loopInfoHandler, this, std::placeholders::_1));
+
+        sub_initial_pose_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+            "initialpose", 10,
+            std::bind(&mapOptimization::initialPoseCB, this, std::placeholders::_1));
 
         pubKeyPoses = create_publisher<sensor_msgs::msg::PointCloud2>("liorf/mapping/trajectory", QosPolicy(history_policy, reliability_policy));
         pubLaserCloudSurround = create_publisher<sensor_msgs::msg::PointCloud2>("liorf/mapping/map_global", QosPolicy(history_policy, reliability_policy));
@@ -188,6 +219,8 @@ public:
         pubSLAMInfo = create_publisher<liorf::msg::CloudInfo>("liorf/mapping/slam_info", QosPolicy(history_policy, reliability_policy));
         pubGpsOdom = create_publisher<nav_msgs::msg::Odometry>("liorf/mapping/gps_odom", QosPolicy(history_policy, reliability_policy));
 
+        pubKnownMap_ = create_publisher<sensor_msgs::msg::PointCloud2>("liorf/localization/known_map", QosPolicy(history_policy, reliability_policy));
+
         srvSaveMap = create_service<liorf::srv::SaveMap>("liorf/save_map", 
                         std::bind(&mapOptimization::saveMapService, this, std::placeholders::_1, std::placeholders::_2 ));
 
@@ -199,6 +232,58 @@ public:
         br = std::make_unique<tf2_ros::TransformBroadcaster>(this);
 
         allocateMemory();
+
+        loadKnownMap();
+
+        surface_points_near_init_.reset(new pcl::PointCloud<PointType>);
+    }
+
+    bool loadKnownMap()
+    {
+        std::cout << "Start to loading map from: " << mapPath << "." << std::endl;
+        std::string global_path = mapPath + "/GlobalMap.pcd";
+        std::string surface_path = mapPath + "/SurfMap.pcd";
+        std::string trajectory_path = mapPath + "/trajectory.pcd";
+        std::string transformations_path = mapPath + "/transformations.pcd";
+
+        if (pcl::io::loadPCDFile(global_path, *known_map_.global_map_raw) == -1
+            || pcl::io::loadPCDFile(surface_path, *known_map_.surface_map_raw) == -1
+            || pcl::io::loadPCDFile(trajectory_path, *known_map_.trajectory_raw) == -1
+            || pcl::io::loadPCDFile(transformations_path, *known_map_.transformations_raw) == -1
+        )
+        {
+            std::cout << "Couldn't load map files"  << std::endl;
+            return false;
+        }
+
+        int keyframes_num = known_map_.trajectory_raw->points.size();
+        std::cout << "Map loaded, which has " << keyframes_num << " keyframes." << std::endl;
+
+        known_map_.surface_points_in_keyframes.resize(keyframes_num);
+        for (int i = 0; i < keyframes_num; ++i)
+        {
+            known_map_.surface_points_in_keyframes[i].reset(new pcl::PointCloud<PointType>);
+        }
+
+        int surface_points_num = known_map_.surface_map_raw->points.size();
+        for (int i = 0; i < surface_points_num; ++ i)
+        {
+            const auto& p = known_map_.surface_map_raw->points[i];
+            known_map_.surface_points_in_keyframes[(int)p.intensity] -> points.push_back(p);
+        }
+        for (int i = 0; i < keyframes_num; ++i)
+        {
+            if (known_map_.surface_points_in_keyframes[i]->points.empty() == true)
+            {
+                std::cout << "Keyframes ID " << i << " has no surface point." << std::endl;
+            }
+        }
+        std::cout << "Loaded " << surface_points_num << " surface points into " << keyframes_num << " keyframes." << std::endl;
+
+        kdtree_keyposes_3d_.reset(new pcl::KdTreeFLANN<PointType>());
+        kdtree_keyposes_3d_->setInputCloud(known_map_.trajectory_raw);
+
+        return true;
     }
 
     void allocateMemory()
@@ -233,6 +318,64 @@ public:
         }
 
         matP = cv::Mat(6, 6, CV_32F, cv::Scalar::all(0));
+    }
+
+    bool extractSurroundKeyFrames(const PointType &p)
+    {
+        std::cout << "-----extract surround keyframes ------ " << std::endl;
+        try
+        {
+            std::vector<int> point_search_idx_;
+            std::vector<float> point_search_dist_;
+            double surround_search_radius_ = 5.0;
+            kdtree_keyposes_3d_->radiusSearch(p, surround_search_radius_, point_search_idx_, point_search_dist_, 0);
+            surface_points_near_init_->clear();
+            for (int i = 0; i < point_search_idx_.size(); ++i)
+            {
+                *surface_points_near_init_ += *known_map_.surface_points_in_keyframes[point_search_idx_[i]];
+            }
+            ds_surf_.setInputCloud(surface_points_near_init_);
+            ds_surf_.filter(*surface_points_near_init_);
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << e.what() << '\n';
+            return false;
+        }
+        std::cout << "extractSurroundKeyFrames takes: " << tt << "ms" << std::endl;
+        return true;
+    }
+
+    void initialPoseCB(
+        geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
+    {
+        PointType p;
+        initpose_.x = msg->pose.pose.position.x;
+        initpose_.y = msg->pose.pose.position.y;
+        initpose_.z = msg->pose.pose.position.z;
+        double roll, pitch, yaw;
+        tf2::Quaternion q;
+        tf2::fromMsg(msg->pose.pose.orientation, q);
+        tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+        initpose_.roll = roll;
+        initpose_.pitch = pitch;
+        initpose_.yaw = yaw;
+
+        p.x = initpose_.x;
+        p.y = initpose_.y;
+        p.z = initpose_.z;
+        std::cout << "Get initial pose: " << _initpose.x << " " << _initpose.y << " " << _initpose.z << " " << roll << " " << pitch << " " << yaw
+                  << std::endl;
+        bool extractSurroundKeyFrameFlag = extractSurroundKeyFrames(p);
+        if (extractSurroundKeyFrameFlag)
+        {
+            std::cout << "extractSurroundKeyFrames successful" << std::endl;
+        }
+        else
+        {
+            std::cout << "extractSurroundKeyFrames failed" << std::endl;
+        }
+        std::cout << "Change flag from " << initializedFlag << " to " << Initializing << ", start do localizating ..." << std::endl;
     }
 
     void laserCloudInfoHandler(const liorf::msg::CloudInfo::SharedPtr msgIn)
@@ -987,12 +1130,14 @@ public:
         std::vector<float> pointSearchSqDis;
 
         // extract all the nearby key poses and downsample them
-        kdtreeSurroundingKeyPoses->setInputCloud(cloudKeyPoses3D); // create kd-tree
+        // kdtreeSurroundingKeyPoses->setInputCloud(cloudKeyPoses3D); // create kd-tree
+        kdtreeSurroundingKeyPoses->setInputCloud(known_map_.trajectory_raw); // create kd-tree
         kdtreeSurroundingKeyPoses->radiusSearch(cloudKeyPoses3D->back(), (double)surroundingKeyframeSearchRadius, pointSearchInd, pointSearchSqDis);
         for (int i = 0; i < (int)pointSearchInd.size(); ++i)
         {
             int id = pointSearchInd[i];
-            surroundingKeyPoses->push_back(cloudKeyPoses3D->points[id]);
+            // surroundingKeyPoses->push_back(cloudKeyPoses3D->points[id]);
+            surroundingKeyPoses->push_back(known_map_.trajectory_raw->points[id]);
         }
 
         downSizeFilterSurroundingKeyPoses.setInputCloud(surroundingKeyPoses);
@@ -1000,18 +1145,19 @@ public:
         for(auto& pt : surroundingKeyPosesDS->points)
         {
             kdtreeSurroundingKeyPoses->nearestKSearch(pt, 1, pointSearchInd, pointSearchSqDis);
-            pt.intensity = cloudKeyPoses3D->points[pointSearchInd[0]].intensity;
+            // pt.intensity = cloudKeyPoses3D->points[pointSearchInd[0]].intensity;
+            pt.intensity = known_map_.trajectory_raw->points[pointSearchInd[0]].intensity;
         }
 
         // also extract some latest key frames in case the robot rotates in one position
-        int numPoses = cloudKeyPoses3D->size();
-        for (int i = numPoses-1; i >= 0; --i)
-        {
-            if (timeLaserInfoCur - cloudKeyPoses6D->points[i].time < 10.0)
-                surroundingKeyPosesDS->push_back(cloudKeyPoses3D->points[i]);
-            else
-                break;
-        }
+        // int numPoses = cloudKeyPoses3D->size();
+        // for (int i = numPoses-1; i >= 0; --i)
+        // {
+        //     if (timeLaserInfoCur - cloudKeyPoses6D->points[i].time < 10.0)
+        //         surroundingKeyPosesDS->push_back(cloudKeyPoses3D->points[i]);
+        //     else
+        //         break;
+        // }
 
         extractCloud(surroundingKeyPosesDS);
     }
@@ -1031,9 +1177,15 @@ public:
                 // transformed cloud available
                 *laserCloudSurfFromMap   += laserCloudMapContainer[thisKeyInd].second;
             } else {
+                if (known_map_.surface_points_in_keyframes[thisKeyInd]->points.empty() == true) {
+                    std::cout << "Keyframe ID " << thisKeyInd << " not found in known surface keyframes" << std::endl;
+                    continue;
+                }
                 // transformed cloud not available
                 pcl::PointCloud<PointType> laserCloudCornerTemp;
-                pcl::PointCloud<PointType> laserCloudSurfTemp = *transformPointCloud(surfCloudKeyFrames[thisKeyInd],    &cloudKeyPoses6D->points[thisKeyInd]);
+                // pcl::PointCloud<PointType> laserCloudSurfTemp = *transformPointCloud(surfCloudKeyFrames[thisKeyInd],    &cloudKeyPoses6D->points[thisKeyInd]);
+                pcl::PointCloud<PointType> laserCloudSurfTemp = *known_map_.surface_points_in_keyframes[thisKeyInd];
+                for (auto& pt : laserCloudSurfTemp.points) pt.intensity = 0;
                 *laserCloudSurfFromMap   += laserCloudSurfTemp;
                 laserCloudMapContainer[thisKeyInd] = make_pair(laserCloudCornerTemp, laserCloudSurfTemp);
             }
@@ -1582,9 +1734,7 @@ public:
         // save all the received edge and surf points
         pcl::PointCloud<PointType>::Ptr thisSurfKeyFrame(new pcl::PointCloud<PointType>());
         pcl::copyPointCloud(*laserCloudSurfLastDS,    *thisSurfKeyFrame);
-        for (int i = 0; i < thisSurfKeyFrame->points.size(); i++) {
-            thisSurfKeyFrame->points[i].intensity = thisPose3D.intensity;
-        }
+
         // save key frame cloud
         surfCloudKeyFrames.push_back(thisSurfKeyFrame);
 
@@ -1803,6 +1953,8 @@ public:
             //     lastSLAMInfoPubSize = cloudKeyPoses6D->size();
             // }
         }
+
+        publishCloud(pubKnownMap_, known_map_.surface_map_raw, timeLaserInfoStamp, mapFrame);
     }
 };
 
@@ -1820,14 +1972,14 @@ int main(int argc, char** argv)
 
     RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "\033[1;32m----> Map Optimization Started.\033[0m");
 
-    std::thread loopthread(&mapOptimization::loopClosureThread, MO);
+    // std::thread loopthread(&mapOptimization::loopClosureThread, MO);
     std::thread visualizeMapThread(&mapOptimization::visualizeGlobalMapThread, MO);
 
     exec.spin();
 
     rclcpp::shutdown();
 
-    loopthread.join();
+    // loopthread.join();
     visualizeMapThread.join();
 
     return 0;
