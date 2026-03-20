@@ -264,7 +264,7 @@ public:
             laserCloudIn->points.resize(tmpRobosenseCloudIn->size());
             laserCloudIn->is_dense = tmpRobosenseCloudIn->is_dense;
 
-            double start_stamptime = tmpRobosenseCloudIn->points[0].timestamp;
+            double start_stamptime = rclcpp::Time(currentCloudMsg.header.stamp).seconds(); // I doubt that use the first points' time would be woring, if all of them are NaN and discard. 
             for (size_t i = 0; i < tmpRobosenseCloudIn->size(); i++) {
                 auto &src = tmpRobosenseCloudIn->points[i];
                 auto &dst = laserCloudIn->points[i];
@@ -319,7 +319,7 @@ public:
             deskewFlag = -1;
             for (auto &field : currentCloudMsg.fields)
             {
-                if (field.name == "time" || field.name == "t")
+                if (field.name == "time" || field.name == "t" || field.name == "timestamp") // The robosense lidars use the timestamp field name
                 {
                     deskewFlag = 1;
                     break;
